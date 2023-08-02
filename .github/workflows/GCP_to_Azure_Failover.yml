@@ -1,1 +1,132 @@
+name: "Terraform Azure Create"
 
+on:
+  workflow_dispatch:
+
+jobs:
+  job_id:
+    # Add "id-token" with the intended permissions.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    # Install the latest version of Terraform CLI and configure the Terraform CLI configuration file with a Terraform Cloud user API token
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      
+
+    # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+    - name: Terraform Init
+      env:
+        ARM_CLIENT_ID : ${{ secrets.ARM_CLIENT_ID }}
+        ARM_TENANT_ID : ${{ secrets.ARM_TENANT_ID }}
+        ARM_SUBSCRIPTION_ID : ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        ARM_CLIENT_SECRET : ${{ secrets.ARM_CLIENT_SECRET }}
+      run: terraform init
+      
+    # Checks that all Terraform configuration files adhere to a canonical format
+    - name: Terraform Format
+      run: terraform fmt
+
+    # Generates an execution plan for Terraform
+    - name: Terraform Plan
+      env:
+        ARM_CLIENT_ID : ${{ secrets.ARM_CLIENT_ID }}
+        ARM_TENANT_ID : ${{ secrets.ARM_TENANT_ID }}
+        ARM_SUBSCRIPTION_ID : ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        ARM_CLIENT_SECRET : ${{ secrets.ARM_CLIENT_SECRET }}      
+      run: terraform plan
+
+    - name: Terraform Apply
+      env:
+        ARM_CLIENT_ID : ${{ secrets.ARM_CLIENT_ID }}
+        ARM_TENANT_ID : ${{ secrets.ARM_TENANT_ID }}
+        ARM_SUBSCRIPTION_ID : ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        ARM_CLIENT_SECRET : ${{ secrets.ARM_CLIENT_SECRET }}      
+      run: terraform apply -auto-approve
+   
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    - name: Azure CLI script
+      uses: azure/CLI@v1
+      with:
+        azcliversion: 2.30.0
+        inlineScript: |
+          az aks get-credentials --resource-group my-aks-cluster-rg --name my-aks-cluster-primary
+          wget https://github.com/vmware-tanzu/velero/releases/download/v1.10.2/velero-v1.10.2-linux-amd64.tar.gz
+          tar -zxvf velero-v1.10.2-linux-amd64.tar.gz
+          cd velero-v1.10.2-linux-amd64
+          echo '${{secrets.GCP_CREDENTIALS}}' > credentials-velero
+          cat credentials-velero
+          ./velero install --plugins velero/velero-plugin-for-gcp:v1.6.0,velero/velero-plugin-for-csi:v0.4.2,velero/velero-plugin-for-microsoft-azure:v1.6.0 --use-node-agent --features=enableCSI --provider gcp --uploader-type restic --bucket 'shagok-velero-backup' --secret-file ./credentials-velero --use-volume-snapshots=false
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          cat << EOF > storage-class-gcp.yml
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: standard-rwo
+          provisioner: kubernetes.io/azure-disk
+          parameters:
+            storageaccounttype: Standard_LRS
+            kind: Managed
+            cachingmode: ReadOnly
+          EOF
+          chmod +x kubectl
+          set +e
+          ./kubectl create -f storage-class-gcp.yml
+          set -e
+          ./kubectl wait pods --all --namespace=velero --for=condition=Ready --timeout=300s
+          echo "Velero installation is completed. Proceeding with restoration."
+          sleep 5
+          # Output file to save timing information
+          OUTPUT_FILE="timing_output.txt"
+
+
+          print_timing() {
+            local minutes=$(( $1 / 60 ))
+            local seconds=$(( $1 % 60 ))
+            printf "Loop %02d: %02d minutes %02d seconds\n" "$i" "$minutes" "$seconds" >> "$GITHUB_WORKSPACE/$OUTPUT_FILE"
+          }
+
+          # Loop 20 times
+          for ((i = 1; i <= 20; i++)); do
+            echo "Running loop $i"
+          # Start timing
+          start_time=$(date +%s)
+          ./velero get backup-locations
+          ./velero restore create --include-namespaces wordpress --from-backup fs-backup
+          sleep 2
+          # Wait for all resources in the namespace to be ready
+          time ./kubectl wait pods --all --namespace=wordpress --for=condition=Ready --timeout=300s 2>&1 | tee -a "$GITHUB_WORKSPACE/$OUTPUT_FILE"
+          # Calculate duration
+          end_time=$(date +%s)
+          duration=$((end_time - start_time))
+          #clear the cluster for next iteration
+          ./kubectl delete ns wordpress
+          ./kubectl wait namespace wordpress --for=delete
+          # Print total duration with iteration number
+          print_timing "$duration"
+          echo "Loop $i completed."
+          done
+          
+    - name: Upload timing_output.txt as an artifact
+      uses: actions/upload-artifact@v2
+      with:
+          name: timing_output
+          path: timing_output.txt
+    
+    - name: Terraform Destroy
+      env:
+        ARM_CLIENT_ID : ${{ secrets.ARM_CLIENT_ID }}
+        ARM_TENANT_ID : ${{ secrets.ARM_TENANT_ID }}
+        ARM_SUBSCRIPTION_ID : ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        ARM_CLIENT_SECRET : ${{ secrets.ARM_CLIENT_SECRET }}      
+      run: terraform destroy -auto-approve
